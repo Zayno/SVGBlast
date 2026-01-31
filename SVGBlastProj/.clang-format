@@ -1,0 +1,52 @@
+# .clang-format
+BasedOnStyle: Microsoft
+Language: Cpp
+
+# Indentation (tabs, width 4)
+UseTab: Always                # indent_style = tab
+IndentWidth: 4                # indent_size = 4
+TabWidth: 4                   # tab_width = 4
+
+# Braces / new lines (Allman + braces on separate lines)
+BreakBeforeBraces: Allman     # cpp_new_line_before_open_brace_* = new_line
+BraceWrapping:
+  AfterNamespace: true
+  AfterClass: true            # "type"
+  AfterStruct: true
+  AfterUnion: true
+  AfterEnum: true
+  AfterFunction: true
+  AfterControlStatement: true # "block"
+  BeforeCatch: true           # cpp_new_line_before_catch = true
+  BeforeElse: true            # cpp_new_line_before_else = true
+  SplitEmptyFunction: true    # cpp_new_line_close_brace_same_line_empty_function = false
+  SplitEmptyRecord: true      # cpp_new_line_close_brace_same_line_empty_type = false
+
+# The key rule you asked for: never allow single-line if
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortBlocksOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: None
+
+# Spaces (mapped as closely as clang-format allows)
+SpaceAfterCStyleCast: false           # cpp_space_after_cast_close_parenthesis = false
+SpaceBeforeParens: ControlStatements  # cpp_space_after_keywords_in_control_flow_statements = true
+SpacesInParentheses: false           # cpp_space_within_*_parentheses = false
+SpacesInSquareBrackets: false        # cpp_space_within_square_brackets = false
+SpaceBeforeSquareBrackets: false     # cpp_space_before_open_square_bracket = false
+SpaceBeforeAssignmentOperators: true # cpp_space_around_assignment_operator = insert
+SpacesInContainerLiterals: true      # cpp_space_within_initializer_list_braces = true
+
+# Pointer/reference alignment (left)
+PointerAlignment: Left               # cpp_space_pointer_reference_alignment = left
+ReferenceAlignment: Pointer
+
+# Includes: VS says forward slashes; clang-format doesn’t control slash direction,
+# but we can keep include sorting behavior predictable.
+SortIncludes: false                  # cpp_include_cleanup_sort_after_edits = false
+IncludeBlocks: Preserve
+
+# Comments / wrapping: VS had preserve_comments = false and wrap_preserve_blocks = never.
+# clang-format can't fully mirror those exact VS behaviors, but these keep things tidy.
+ReflowComments: false
