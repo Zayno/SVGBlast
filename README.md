@@ -7,7 +7,7 @@ A fast, lightweight SVG viewer for Windows with GPU-accelerated rendering.
 ![C++](https://img.shields.io/badge/C++-00599C?logo=cplusplus&logoColor=white)
 
 ---
-
+![SVGBlast Wiaam Suleiman.](/Images/Banner.png "SVG Blast")
 ## Features
 
 **Viewer**
