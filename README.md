@@ -46,6 +46,11 @@ A fast, lightweight SVG viewer for Windows with GPU-accelerated rendering.
 
 ---
 
+## Youtube Demo
+[![Video Thumbnail](https://img.youtube.com/vi/dTReGeQIMcQ/0.jpg)](https://www.youtube.com/watch?v=dTReGeQIMcQ)
+
+---
+
 ## Requirements
 
 - Windows 10/11
