@@ -97,17 +97,21 @@ std::vector<HANDLE> g_WorkerThreads;
 struct RenderRequest
 {
 	resvg_render_tree* tree; // The tree to render (owned by main thread, read-only for worker)
-	int width;
-	int height;
+	int texWidth;			 // Output texture width (pixels)
+	int texHeight;			 // Output texture height (pixels)
 	float zoom;
+	// Viewport in SVG coordinates (the sub-rect of the SVG to render)
+	float svgViewX, svgViewY, svgViewW, svgViewH;
 	LONG requestId; // Incremented for each new request, used to detect stale results
 };
 
 struct RenderResult
 {
-	int width;
-	int height;
+	int texWidth;
+	int texHeight;
 	float zoom;
+	// Echo back the viewport so main thread knows what region this texture covers
+	float svgViewX, svgViewY, svgViewW, svgViewH;
 	LONG requestId; // Matches the request this result is for
 	bool valid;		// True if rendering succeeded
 };
@@ -134,7 +138,8 @@ bool g_HasPendingResult = false;
 DWORD WINAPI BackgroundRenderThread(LPVOID lpParam);
 void StartBackgroundRenderThread();
 void StopBackgroundRenderThread();
-void RequestBackgroundRender(resvg_render_tree* tree, int width, int height, float zoom);
+void RequestBackgroundRender(resvg_render_tree* tree, int texWidth, int texHeight, float zoom, float svgViewX,
+							 float svgViewY, float svgViewW, float svgViewH);
 bool TryGetRenderResult(RenderResult& outResult);
 void DrawRenderingEffect(ImVec2 center, float time);
 
@@ -635,7 +640,7 @@ DWORD WINAPI BackgroundRenderThread(LPVOID lpParam)
 		}
 		LeaveCriticalSection(&g_RenderRequestCS);
 
-		if (!hasRequest || !request.tree || request.width <= 0 || request.height <= 0)
+		if (!hasRequest || !request.tree || request.texWidth <= 0 || request.texHeight <= 0)
 			continue;
 
 		// Check if this request is still current (not superseded by a newer one)
@@ -646,22 +651,26 @@ DWORD WINAPI BackgroundRenderThread(LPVOID lpParam)
 		// Signal that rendering is in progress
 		g_RenderInProgress.store(true, std::memory_order_release);
 
-		// Build the transform
-		resvg_size svgSize = resvg_get_image_size(request.tree);
-		resvg_transform transform = resvg_transform_identity();
-		if (svgSize.width > 0)
-		{
-			float scale = (float)request.width / svgSize.width;
-			transform.a = scale;
-			transform.d = scale;
-		}
+		// Build transform that maps the SVG viewport rect to the output texture.
+		// We want: svgViewX..svgViewX+svgViewW  ->  0..texWidth
+		//          svgViewY..svgViewY+svgViewH  ->  0..texHeight
+		float scaleX = (float)request.texWidth / request.svgViewW;
+		float scaleY = (float)request.texHeight / request.svgViewH;
+
+		resvg_transform transform;
+		transform.a = scaleX;
+		transform.b = 0.0f;
+		transform.c = 0.0f;
+		transform.d = scaleY;
+		transform.e = -request.svgViewX * scaleX;
+		transform.f = -request.svgViewY * scaleY;
 
 		// Render to MainPixels with mutex protection
-		size_t bufferSize = (size_t)request.width * request.height * 4;
+		size_t bufferSize = (size_t)request.texWidth * request.texHeight * 4;
 
 		EnterCriticalSection(&g_MainPixelsCS);
 		ZeroMemory(MainPixels, bufferSize);
-		resvg_render(request.tree, transform, request.width, request.height, (char*)MainPixels);
+		resvg_render(request.tree, transform, request.texWidth, request.texHeight, (char*)MainPixels);
 		LeaveCriticalSection(&g_MainPixelsCS);
 
 		// Signal that rendering is complete
@@ -674,9 +683,13 @@ DWORD WINAPI BackgroundRenderThread(LPVOID lpParam)
 
 		// Store the result metadata (pixels are in MainPixels, protected by g_MainPixelsCS)
 		EnterCriticalSection(&g_RenderResultCS);
-		g_RenderResult.width = request.width;
-		g_RenderResult.height = request.height;
+		g_RenderResult.texWidth = request.texWidth;
+		g_RenderResult.texHeight = request.texHeight;
 		g_RenderResult.zoom = request.zoom;
+		g_RenderResult.svgViewX = request.svgViewX;
+		g_RenderResult.svgViewY = request.svgViewY;
+		g_RenderResult.svgViewW = request.svgViewW;
+		g_RenderResult.svgViewH = request.svgViewH;
 		g_RenderResult.requestId = request.requestId;
 		g_RenderResult.valid = true;
 		g_HasPendingResult = true;
@@ -726,7 +739,8 @@ void StopBackgroundRenderThread()
 	DeleteCriticalSection(&g_MainPixelsCS);
 }
 
-void RequestBackgroundRender(resvg_render_tree* tree, int width, int height, float zoom)
+void RequestBackgroundRender(resvg_render_tree* tree, int texWidth, int texHeight, float zoom, float svgViewX,
+							 float svgViewY, float svgViewW, float svgViewH)
 {
 	// Increment the request ID to invalidate any in-flight render
 	LONG newId = g_CurrentRequestId.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -734,9 +748,13 @@ void RequestBackgroundRender(resvg_render_tree* tree, int width, int height, flo
 	// Set up the new request
 	EnterCriticalSection(&g_RenderRequestCS);
 	g_RenderRequest.tree = tree;
-	g_RenderRequest.width = width;
-	g_RenderRequest.height = height;
+	g_RenderRequest.texWidth = texWidth;
+	g_RenderRequest.texHeight = texHeight;
 	g_RenderRequest.zoom = zoom;
+	g_RenderRequest.svgViewX = svgViewX;
+	g_RenderRequest.svgViewY = svgViewY;
+	g_RenderRequest.svgViewW = svgViewW;
+	g_RenderRequest.svgViewH = svgViewH;
 	g_RenderRequest.requestId = newId;
 	g_HasPendingRequest = true;
 	LeaveCriticalSection(&g_RenderRequestCS);
@@ -811,7 +829,8 @@ struct ViewState
 	int svgHeight = 0;
 
 	// Zoom limits
-	static constexpr float MIN_ZOOM = 0.1f; // 10%
+	static constexpr float MIN_ZOOM = 0.1f;	  // 10%
+	static constexpr float MAX_ZOOM = 256.0f; // 25600% - practically unlimited
 
 	// Re-render timing
 	ULONGLONG lastZoomTime = 0;
@@ -819,10 +838,17 @@ struct ViewState
 	float lastRenderedZoom = 1.0f;
 	float renderRequestedZoom = 1.0f; // Zoom level of the last background render request
 
+	// Viewport tracking: the SVG-space rect that the current texture covers
+	float texSvgViewX = 0, texSvgViewY = 0, texSvgViewW = 0, texSvgViewH = 0;
+	bool hasViewportTexture = false; // True when current texture is a viewport render (not full SVG)
+
 	// Dragging state
 	bool isDragging = false;
 	ImVec2 dragStartPos = {0.0f, 0.0f};
 	ImVec2 panAtDragStart = {0.0f, 0.0f};
+
+	// Track last pan for detecting when re-render is needed after panning
+	ImVec2 lastRenderedPan = {0.0f, 0.0f};
 
 	void Reset()
 	{
@@ -831,25 +857,61 @@ struct ViewState
 		needsRerender = false;
 		lastRenderedZoom = 1.0f;
 		renderRequestedZoom = 1.0f;
-	}
-
-	float GetMaxZoom() const
-	{
-		if (svgWidth <= 0 || svgHeight <= 0)
-			return 10.0f; // Fallback
-
-		int largestDim = (svgWidth > svgHeight) ? svgWidth : svgHeight;
-		return (float)g_MaxTextureSize / (float)largestDim;
+		hasViewportTexture = false;
+		lastRenderedPan = {0.0f, 0.0f};
 	}
 
 	float ClampZoom(float z) const
 	{
-		float maxZoom = GetMaxZoom();
 		if (z < MIN_ZOOM)
 			return MIN_ZOOM;
-		if (z > maxZoom)
-			return maxZoom;
+		if (z > MAX_ZOOM)
+			return MAX_ZOOM;
 		return z;
+	}
+
+	// Check if the full zoomed SVG fits within a single texture
+	bool FitsInSingleTexture() const
+	{
+		int zoomedW = (int)(svgWidth * zoom);
+		int zoomedH = (int)(svgHeight * zoom);
+		return zoomedW <= (int)g_MaxTextureSize && zoomedH <= (int)g_MaxTextureSize;
+	}
+
+	// Calculate the visible SVG-space rect given current viewport
+	// contentPos/contentSize = screen-space content area
+	void CalcVisibleSvgRect(ImVec2 contentPos, ImVec2 contentSize, float& outSvgX, float& outSvgY, float& outSvgW,
+							float& outSvgH) const
+	{
+		// Image top-left in screen space
+		float contentCenterX = contentPos.x + contentSize.x * 0.5f;
+		float contentCenterY = contentPos.y + contentSize.y * 0.5f;
+		float displayW = svgWidth * zoom;
+		float displayH = svgHeight * zoom;
+		float imgScreenX = contentCenterX - displayW * 0.5f + pan.x;
+		float imgScreenY = contentCenterY - displayH * 0.5f + pan.y;
+
+		// Visible screen rect = contentPos .. contentPos+contentSize
+		// Convert screen rect to SVG coordinates:
+		// svgX = (screenX - imgScreenX) / zoom
+		float visLeft = (contentPos.x - imgScreenX) / zoom;
+		float visTop = (contentPos.y - imgScreenY) / zoom;
+		float visRight = (contentPos.x + contentSize.x - imgScreenX) / zoom;
+		float visBottom = (contentPos.y + contentSize.y - imgScreenY) / zoom;
+
+		// Add margin (10% on each side) so we render a bit beyond the viewport
+		// This reduces re-renders when panning slightly
+		float marginX = (visRight - visLeft) * 0.1f;
+		float marginY = (visBottom - visTop) * 0.1f;
+		visLeft -= marginX;
+		visTop -= marginY;
+		visRight += marginX;
+		visBottom += marginY;
+
+		outSvgX = visLeft;
+		outSvgY = visTop;
+		outSvgW = visRight - visLeft;
+		outSvgH = visBottom - visTop;
 	}
 };
 
@@ -1239,6 +1301,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 	}
 
 	view.lastRenderedZoom = 1.0f;
+	view.hasViewportTexture = false;
+	view.texSvgViewX = 0;
+	view.texSvgViewY = 0;
+	view.texSvgViewW = (float)view.svgWidth;
+	view.texSvgViewH = (float)view.svgHeight;
 
 	SVG_Path_List = ListSVGFiles(pMainFile->parent_path());
 	for (size_t i = 0; i < SVG_Path_List.size(); i++)
@@ -1301,19 +1368,60 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 		if (view.needsRerender)
 		{
 			ULONGLONG currentTime = GetTickCount64();
-			if (currentTime - view.lastZoomTime >= 500) // 500ms delay after last zoom
+			if (currentTime - view.lastZoomTime >= 500) // 500ms delay after last zoom/pan
 			{
-				int newWidth = (int)(view.svgWidth * view.zoom);
-				int newHeight = (int)(view.svgHeight * view.zoom);
-
-				if (newWidth > 0 && newHeight > 0 && MainTree)
+				if (MainTree && view.svgWidth > 0 && view.svgHeight > 0)
 				{
-					// Request background render - this returns immediately
-					RequestBackgroundRender(MainTree, newWidth, newHeight, view.zoom);
-					view.renderRequestedZoom = view.zoom; // Track what zoom we requested
+					ImGuiViewport* vpForCalc = ImGui::GetMainViewport();
+					ImVec2 calcPos = vpForCalc->Pos;
+					ImVec2 calcSize = vpForCalc->Size;
+
+					if (view.FitsInSingleTexture())
+					{
+						// Small enough to render the whole SVG into one texture
+						int newWidth = (int)(view.svgWidth * view.zoom);
+						int newHeight = (int)(view.svgHeight * view.zoom);
+						if (newWidth > 0 && newHeight > 0)
+						{
+							RequestBackgroundRender(MainTree, newWidth, newHeight, view.zoom, 0.0f, 0.0f,
+													(float)view.svgWidth, (float)view.svgHeight);
+							view.renderRequestedZoom = view.zoom;
+						}
+					}
+					else
+					{
+						// Viewport mode: render only the visible region
+						float svgVX, svgVY, svgVW, svgVH;
+						view.CalcVisibleSvgRect(calcPos, calcSize, svgVX, svgVY, svgVW, svgVH);
+
+						// Texture size = viewport SVG rect * zoom, clamped to max texture size
+						int texW = (int)(svgVW * view.zoom);
+						int texH = (int)(svgVH * view.zoom);
+						if (texW > (int)g_MaxTextureSize)
+							texW = (int)g_MaxTextureSize;
+						if (texH > (int)g_MaxTextureSize)
+							texH = (int)g_MaxTextureSize;
+
+						if (texW > 0 && texH > 0)
+						{
+							// Recompute actual SVG rect from clamped texture size
+							// (keeps pixel density consistent)
+							float actualSvgW = (float)texW / view.zoom;
+							float actualSvgH = (float)texH / view.zoom;
+							float centerX = svgVX + svgVW * 0.5f;
+							float centerY = svgVY + svgVH * 0.5f;
+							float actualSvgX = centerX - actualSvgW * 0.5f;
+							float actualSvgY = centerY - actualSvgH * 0.5f;
+
+							RequestBackgroundRender(MainTree, texW, texH, view.zoom, actualSvgX, actualSvgY, actualSvgW,
+													actualSvgH);
+							view.renderRequestedZoom = view.zoom;
+						}
+					}
 				}
 
 				view.needsRerender = false;
+				view.lastRenderedPan = view.pan;
 			}
 		}
 
@@ -1327,9 +1435,25 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 				EnterCriticalSection(&g_MainPixelsCS);
 				ReleaseTexture_D3D11(currentTexture);
 				currentTexture = 0;
-				currentTexture = UploadTexture_D3D11(g_pd3dDevice, MainPixels, renderResult.width, renderResult.height);
+				currentTexture =
+					UploadTexture_D3D11(g_pd3dDevice, MainPixels, renderResult.texWidth, renderResult.texHeight);
 				LeaveCriticalSection(&g_MainPixelsCS);
 				view.lastRenderedZoom = renderResult.zoom;
+
+				// Track what SVG region this texture covers
+				view.texSvgViewX = renderResult.svgViewX;
+				view.texSvgViewY = renderResult.svgViewY;
+				view.texSvgViewW = renderResult.svgViewW;
+				view.texSvgViewH = renderResult.svgViewH;
+
+				// Is this a viewport render or full SVG?
+				bool isFullSvg =
+					(renderResult.svgViewX == 0.0f && renderResult.svgViewY == 0.0f &&
+					 (int)renderResult.svgViewW == view.svgWidth && (int)renderResult.svgViewH == view.svgHeight);
+				view.hasViewportTexture = !isFullSvg;
+
+				renderWidth = renderResult.texWidth;
+				renderHeight = renderResult.texHeight;
 			}
 		}
 
@@ -1388,8 +1512,28 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 			// Draw checker background filling the entire content area
 			DrawCheckerBackground(contentPos, contentEnd, c1, c2, 16.0f);
 
-			// Draw the image
-			ImGui::GetWindowDrawList()->AddImage(currentTexture, imagePos, imageEnd);
+			// Draw the image - position depends on whether texture is full SVG or viewport
+			if (view.hasViewportTexture)
+			{
+				// Viewport texture: texture covers texSvgView* in SVG space
+				// Map that SVG rect to screen coordinates
+				float imgScreenX = contentCenter.x - (view.svgWidth * view.zoom) * 0.5f + view.pan.x;
+				float imgScreenY = contentCenter.y - (view.svgHeight * view.zoom) * 0.5f + view.pan.y;
+
+				float vpScreenX = imgScreenX + view.texSvgViewX * view.zoom;
+				float vpScreenY = imgScreenY + view.texSvgViewY * view.zoom;
+				float vpScreenW = view.texSvgViewW * view.zoom;
+				float vpScreenH = view.texSvgViewH * view.zoom;
+
+				ImVec2 vpPos = ImVec2(vpScreenX, vpScreenY);
+				ImVec2 vpEnd = ImVec2(vpScreenX + vpScreenW, vpScreenY + vpScreenH);
+				ImGui::GetWindowDrawList()->AddImage(currentTexture, vpPos, vpEnd);
+			}
+			else
+			{
+				// Full SVG texture: draw as before
+				ImGui::GetWindowDrawList()->AddImage(currentTexture, imagePos, imageEnd);
+			}
 
 			// Handle input
 			ImVec2 mousePos = io.MousePos;
@@ -1462,6 +1606,20 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 				else
 				{
 					view.isDragging = false;
+
+					// If we're in viewport mode, re-render after panning
+					// (the user may have panned outside the rendered region)
+					if (view.hasViewportTexture)
+					{
+						float panDeltaX = view.pan.x - view.lastRenderedPan.x;
+						float panDeltaY = view.pan.y - view.lastRenderedPan.y;
+						float panDist = sqrtf(panDeltaX * panDeltaX + panDeltaY * panDeltaY);
+						if (panDist > 10.0f) // Only re-render if panned more than 10 pixels
+						{
+							view.lastZoomTime = GetTickCount64();
+							view.needsRerender = true;
+						}
+					}
 				}
 			}
 
@@ -1483,39 +1641,56 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 					bool isRendering = g_RenderInProgress.load(std::memory_order_acquire);
 					if (isRendering == false)
 					{
-
 						// Generate default filename from SVG name
 						std::wstring defaultName = pMainFile->stem().wstring() + L".png";
 						std::wstring savePath = SavePngFileDialog(hwnd, defaultName);
 
 						if (!savePath.empty())
 						{
-							// Use the already-rendered MainPixels at lastRenderedZoom
-							int saveWidth = (int)(view.svgWidth * view.lastRenderedZoom);
-							int saveHeight = (int)(view.svgHeight * view.lastRenderedZoom);
+							// Save full SVG at current zoom level
+							int saveWidth = (int)(view.svgWidth * view.zoom);
+							int saveHeight = (int)(view.svgHeight * view.zoom);
 
-							if (saveWidth > 0 && saveHeight > 0)
+							if (saveWidth > 0 && saveHeight > 0 && MainTree)
 							{
-								std::string savePathUtf8 = WideToUtf8(savePath);
+								size_t saveBufferSize = (size_t)saveWidth * saveHeight * 4;
+								uint8_t* savePixels = (uint8_t*)malloc(saveBufferSize);
 
-								EnterCriticalSection(&g_MainPixelsCS);
-								FILE* f = _wfopen(savePath.c_str(), L"wb");
-								if (f)
+								if (savePixels)
 								{
-									int result = stbi_write_png_to_func(stbi_write_callback, f, saveWidth, saveHeight,
-																		4, MainPixels, saveWidth * 4);
-									fclose(f);
+									memset(savePixels, 0, saveBufferSize);
 
-									if (result == 0)
+									resvg_transform saveTransform = resvg_transform_identity();
+									saveTransform.a = view.zoom;
+									saveTransform.d = view.zoom;
+
+									resvg_render(MainTree, saveTransform, saveWidth, saveHeight, (char*)savePixels);
+
+									FILE* f = _wfopen(savePath.c_str(), L"wb");
+									if (f)
 									{
-										MessageBoxW(hwnd, L"Failed to save PNG file.", L"Error", MB_OK | MB_ICONERROR);
+										int result = stbi_write_png_to_func(stbi_write_callback, f, saveWidth,
+																			saveHeight, 4, savePixels, saveWidth * 4);
+										fclose(f);
+
+										if (result == 0)
+										{
+											MessageBoxW(hwnd, L"Failed to save PNG file.", L"Error",
+														MB_OK | MB_ICONERROR);
+										}
 									}
+									else
+									{
+										MessageBoxW(hwnd, L"Failed to create file.", L"Error", MB_OK | MB_ICONERROR);
+									}
+
+									free(savePixels);
 								}
 								else
 								{
-									MessageBoxW(hwnd, L"Failed to create file.", L"Error", MB_OK | MB_ICONERROR);
+									MessageBoxW(hwnd, L"Not enough memory to save at this zoom level.", L"Error",
+												MB_OK | MB_ICONERROR);
 								}
-								LeaveCriticalSection(&g_MainPixelsCS);
 							}
 						}
 					}
@@ -1611,6 +1786,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
 					// Reset view state
 					view.Reset();
+
+					// Set up full-SVG viewport tracking
+					view.texSvgViewX = 0;
+					view.texSvgViewY = 0;
+					view.texSvgViewW = (float)renderWidth;
+					view.texSvgViewH = (float)renderHeight;
 
 					// Switch to main view
 					g_ShowMainWindow = true;
