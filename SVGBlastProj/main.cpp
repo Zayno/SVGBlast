@@ -47,6 +47,7 @@ resvg_options* g_RESVG_Options = NULL;
 
 bool g_ShowMainWindow = true;
 bool g_ShowHelp = false;
+bool g_ExtraZoom = true; // true = viewport-based unlimited zoom, false = classic texture-limited zoom
 std::vector<std::wstring> SVG_Path_List;
 std::vector<std::string> SVG_Path_List_UTF8;
 std::vector<ImTextureID> g_Textures;
@@ -830,7 +831,7 @@ struct ViewState
 
 	// Zoom limits
 	static constexpr float MIN_ZOOM = 0.1f;	  // 10%
-	static constexpr float MAX_ZOOM = 256.0f; // 25600% - practically unlimited
+	static constexpr float MAX_ZOOM = 512.0f; // 25600% - practically unlimited
 
 	// Re-render timing
 	ULONGLONG lastZoomTime = 0;
@@ -863,10 +864,24 @@ struct ViewState
 
 	float ClampZoom(float z) const
 	{
+		float maxZoom = MAX_ZOOM;
+		if (!g_ExtraZoom)
+		{
+			// Classic mode: limit zoom so full SVG fits in one texture
+			if (svgWidth > 0 && svgHeight > 0)
+			{
+				int largestDim = (svgWidth > svgHeight) ? svgWidth : svgHeight;
+				maxZoom = (float)g_MaxTextureSize / (float)largestDim;
+			}
+			else
+			{
+				maxZoom = 10.0f;
+			}
+		}
 		if (z < MIN_ZOOM)
 			return MIN_ZOOM;
-		if (z > MAX_ZOOM)
-			return MAX_ZOOM;
+		if (z > maxZoom)
+			return maxZoom;
 		return z;
 	}
 
@@ -1632,6 +1647,19 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 					view.needsRerender = true;
 					view.lastZoomTime = GetTickCount64();
 				}
+				if (ImGui::MenuItem("Enable Extra Zoom", nullptr, g_ExtraZoom))
+				{
+					g_ExtraZoom = !g_ExtraZoom;
+					// Re-clamp zoom to new limits and trigger re-render
+					float clamped = view.ClampZoom(view.zoom);
+					if (clamped != view.zoom)
+					{
+						view.zoom = clamped;
+					}
+					view.hasViewportTexture = false;
+					view.lastZoomTime = GetTickCount64();
+					view.needsRerender = true;
+				}
 				if (ImGui::MenuItem("File name to Clipboard"))
 				{
 					ImGui::SetClipboardText(pMainFile->u8string().c_str());
@@ -1654,42 +1682,66 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 							if (saveWidth > 0 && saveHeight > 0 && MainTree)
 							{
 								size_t saveBufferSize = (size_t)saveWidth * saveHeight * 4;
-								uint8_t* savePixels = (uint8_t*)malloc(saveBufferSize);
 
-								if (savePixels)
+								// Show confirmation with memory usage
+								wchar_t confirmMsg[256];
+								double sizeMB = (double)saveBufferSize / (1024.0 * 1024.0);
+								if (sizeMB >= 1024.0)
 								{
-									memset(savePixels, 0, saveBufferSize);
-
-									resvg_transform saveTransform = resvg_transform_identity();
-									saveTransform.a = view.zoom;
-									saveTransform.d = view.zoom;
-
-									resvg_render(MainTree, saveTransform, saveWidth, saveHeight, (char*)savePixels);
-
-									FILE* f = _wfopen(savePath.c_str(), L"wb");
-									if (f)
-									{
-										int result = stbi_write_png_to_func(stbi_write_callback, f, saveWidth,
-																			saveHeight, 4, savePixels, saveWidth * 4);
-										fclose(f);
-
-										if (result == 0)
-										{
-											MessageBoxW(hwnd, L"Failed to save PNG file.", L"Error",
-														MB_OK | MB_ICONERROR);
-										}
-									}
-									else
-									{
-										MessageBoxW(hwnd, L"Failed to create file.", L"Error", MB_OK | MB_ICONERROR);
-									}
-
-									free(savePixels);
+									_snwprintf(confirmMsg, 256,
+											   L"Saving at current zoom will require %.1f GB of memory.\n"
+											   L"Image size: %d x %d pixels.\n\nProceed?",
+											   sizeMB / 1024.0, saveWidth, saveHeight);
 								}
 								else
 								{
-									MessageBoxW(hwnd, L"Not enough memory to save at this zoom level.", L"Error",
-												MB_OK | MB_ICONERROR);
+									_snwprintf(confirmMsg, 256,
+											   L"Saving at current zoom will require %.0f MB of memory.\n"
+											   L"Image size: %d x %d pixels.\n\nProceed?",
+											   sizeMB, saveWidth, saveHeight);
+								}
+
+								if (MessageBoxW(hwnd, confirmMsg, L"Save as PNG", MB_YESNO | MB_ICONQUESTION) == IDYES)
+								{
+									uint8_t* savePixels = (uint8_t*)malloc(saveBufferSize);
+
+									if (savePixels)
+									{
+										memset(savePixels, 0, saveBufferSize);
+
+										resvg_transform saveTransform = resvg_transform_identity();
+										saveTransform.a = view.zoom;
+										saveTransform.d = view.zoom;
+
+										resvg_render(MainTree, saveTransform, saveWidth, saveHeight, (char*)savePixels);
+
+										FILE* f = _wfopen(savePath.c_str(), L"wb");
+										if (f)
+										{
+											int result =
+												stbi_write_png_to_func(stbi_write_callback, f, saveWidth, saveHeight, 4,
+																	   savePixels, saveWidth * 4);
+											fclose(f);
+
+											if (result == 0)
+											{
+												MessageBoxW(hwnd, L"Failed to save PNG file.", L"Error",
+															MB_OK | MB_ICONERROR);
+											}
+										}
+										else
+										{
+											MessageBoxW(hwnd, L"Failed to create file.", L"Error",
+														MB_OK | MB_ICONERROR);
+										}
+
+										free(savePixels);
+									}
+									else
+									{
+										MessageBoxW(hwnd, L"Not enough memory to save at this zoom level.", L"Error",
+													MB_OK | MB_ICONERROR);
+									}
 								}
 							}
 						}
