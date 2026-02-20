@@ -11,6 +11,7 @@ A fast, lightweight SVG viewer for Windows with GPU-accelerated rendering.
 ## Features
 
 **Viewer**
+- EXTREMELY fast thumbnailer
 - Smooth zoom with mouse wheel (zoom-to-cursor)
 - Pan with click-and-drag
 - Checkerboard transparency background
@@ -19,7 +20,6 @@ A fast, lightweight SVG viewer for Windows with GPU-accelerated rendering.
 **Folder Browser**
 - Thumbnail grid of all SVGs in a folder
 - Multi-threaded background thumbnail generation
-- Progress indicator during loading
 - Double-click to explore, double-click to return
 
 **Export**
