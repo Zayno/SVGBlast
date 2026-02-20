@@ -47,7 +47,7 @@ A fast, lightweight SVG viewer for Windows with GPU-accelerated rendering.
 ---
 
 ## Zoom Demo
-Download [Princess Kitaro SVG](https://github.com/Zayno/SVGBlast/blob/master/Images/Princess%20Kitaro.svg) and view it with SVGBlast!
+Download [Princess Kitaro SVG](https://github.com/Zayno/SVGBlast/releases/download/V1.1/Princess.Kitaro.svg) and view it with SVGBlast!
 
 ![SVGBlast Wiaam Suleiman.](/Images/Zoom.png "Princess Kitaro")
 
