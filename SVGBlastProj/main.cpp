@@ -47,7 +47,7 @@ resvg_options* g_RESVG_Options = NULL;
 
 bool g_ShowMainWindow = true;
 bool g_ShowHelp = false;
-bool g_ExtraZoom = true; // true = viewport-based unlimited zoom, false = classic texture-limited zoom
+bool g_ExtraZoom = false; // true = viewport-based unlimited zoom, false = classic texture-limited zoom
 std::vector<std::wstring> SVG_Path_List;
 std::vector<std::string> SVG_Path_List_UTF8;
 std::vector<ImTextureID> g_Textures;
