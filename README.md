@@ -46,6 +46,10 @@ A fast, lightweight SVG viewer for Windows with GPU-accelerated rendering.
 
 ---
 
+## Zoom Demo
+![SVGBlast Wiaam Suleiman.](/Images/Zoom.png "Princess Kitaro")
+
+
 ## Youtube Demo
 [![Video Thumbnail](https://img.youtube.com/vi/dTReGeQIMcQ/0.jpg)](https://www.youtube.com/watch?v=dTReGeQIMcQ)
 
