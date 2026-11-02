@@ -36,6 +36,7 @@ static IDXGISwapChain* g_pSwapChain = nullptr;
 static bool g_SwapChainOccluded = false;
 static UINT g_ResizeWidth = 0, g_ResizeHeight = 0;
 static ID3D11RenderTargetView* g_mainRenderTargetView = nullptr;
+static ID3D11BlendState* g_pPremultipliedBlendState = nullptr; // resvg output is premultiplied RGBA
 static size_t g_MaxTextureSize = 8192; // Will be set based on feature level
 const float clear_color[4] = {1.0f, 1.0f, 1.0f, 1.00f};
 
@@ -291,6 +292,11 @@ void CleanupRenderTarget()
 void CleanupDeviceD3D()
 {
 	CleanupRenderTarget();
+	if (g_pPremultipliedBlendState)
+	{
+		g_pPremultipliedBlendState->Release();
+		g_pPremultipliedBlendState = nullptr;
+	}
 	if (g_pSwapChain)
 	{
 		g_pSwapChain->Release();
@@ -356,7 +362,50 @@ bool CreateDeviceD3D(HWND hWnd)
 		return false;
 	}
 	CreateRenderTarget();
+
+	// Same as ImGui's blend state, but for premultiplied source colors (SrcBlend = ONE instead of SRC_ALPHA)
+	D3D11_BLEND_DESC blendDesc = {};
+	blendDesc.RenderTarget[0].BlendEnable = TRUE;
+	blendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+	blendDesc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+	blendDesc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+	blendDesc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+	blendDesc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+	blendDesc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+	blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+	if (FAILED(g_pd3dDevice->CreateBlendState(&blendDesc, &g_pPremultipliedBlendState)))
+	{
+		CleanupDeviceD3D();
+		MessageBox(NULL, _T("Failed to create blend state."), _T("Error"), MB_OK | MB_ICONERROR);
+		return false;
+	}
 	return true;
+}
+
+// ImDrawList callback: draw the following commands with premultiplied-alpha blending.
+// Follow the image with ImDrawCallback_ResetRenderState to restore ImGui's blend state.
+static void SetPremultipliedBlend(const ImDrawList* parentList, const ImDrawCmd* cmd)
+{
+	(void)parentList;
+	(void)cmd;
+	const float blendFactor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	g_pd3dDeviceContext->OMSetBlendState(g_pPremultipliedBlendState, blendFactor, 0xffffffff);
+}
+
+// resvg renders premultiplied RGBA; PNG files and ImGui's default blending expect straight alpha.
+static void UnpremultiplyAlpha(uint8_t* rgba, size_t pixelCount)
+{
+	for (size_t i = 0; i < pixelCount; i++)
+	{
+		uint8_t* p = rgba + i * 4;
+		unsigned a = p[3];
+		if (a != 0 && a != 255)
+		{
+			p[0] = (uint8_t)((p[0] * 255u + a / 2) / a);
+			p[1] = (uint8_t)((p[1] * 255u + a / 2) / a);
+			p[2] = (uint8_t)((p[2] * 255u + a / 2) / a);
+		}
+	}
 }
 
 static void ReleaseTexture_D3D11(ImTextureID texId)
@@ -539,6 +588,9 @@ DWORD WINAPI ThumbnailWorkerThread(LPVOID lpParam)
 		// Render
 		resvg_render(tree, transform, THUMB_SIZE, THUMB_SIZE, (char*)pixels);
 
+		// Thumbnails are drawn by ImageButton with ImGui's straight-alpha blending
+		UnpremultiplyAlpha(pixels, THUMB_SIZE * THUMB_SIZE);
+
 		// Clean up the tree
 		resvg_tree_destroy(tree);
 
@@ -613,6 +665,96 @@ void StopThumbnailWorkers()
 }
 
 // ============================================================================
+// Parallel Strip Rendering
+// ============================================================================
+// resvg renders on a single thread. At deep zoom levels the cost is per pixel (every
+// stacked shape covers the whole view), so the output is split into full-width
+// horizontal strips rendered on separate threads. A strip's rows are contiguous in the
+// destination buffer, so each strip is rendered in place without copying.
+// Every resvg_render call also walks the whole tree, so strips are only made as small
+// as the pixel count justifies.
+// ============================================================================
+
+struct StripJob
+{
+	const resvg_render_tree* tree;
+	resvg_transform transform;
+	int width;
+	int height;
+	uint8_t* dst;
+	int stripCount;
+	std::atomic<int> nextStrip{0};
+	LONG requestId; // 0 = never cancelled, otherwise give up once g_CurrentRequestId moves past it
+	std::atomic<bool> cancelled{false};
+};
+
+static DWORD WINAPI StripWorkerThread(LPVOID lpParam)
+{
+	StripJob* job = (StripJob*)lpParam;
+
+	while (true)
+	{
+		int strip = job->nextStrip.fetch_add(1, std::memory_order_relaxed);
+		if (strip >= job->stripCount)
+			return 0;
+
+		if (job->requestId != 0 && g_CurrentRequestId.load(std::memory_order_acquire) != job->requestId)
+		{
+			job->cancelled.store(true, std::memory_order_release);
+			return 0;
+		}
+
+		int y0 = (int)((int64_t)job->height * strip / job->stripCount);
+		int y1 = (int)((int64_t)job->height * (strip + 1) / job->stripCount);
+		uint8_t* stripPixels = job->dst + (size_t)y0 * job->width * 4;
+		memset(stripPixels, 0, (size_t)(y1 - y0) * job->width * 4);
+
+		// Shift the content up so this strip's first row lands on row 0 of its buffer
+		resvg_transform transform = job->transform;
+		transform.f -= (float)y0;
+		resvg_render(job->tree, transform, job->width, y1 - y0, (char*)stripPixels);
+	}
+}
+
+// Renders the tree into a width x height premultiplied RGBA buffer (cleared first) using all cores.
+// With a non-zero requestId it stops early once a newer background render is requested, and returns false.
+static bool RenderParallel(const resvg_render_tree* tree, resvg_transform transform, int width, int height,
+						   uint8_t* dst, LONG requestId)
+{
+	const int64_t PIXELS_PER_STRIP = 400000; // measured sweet spot between tree-walk overhead and parallelism
+
+	int64_t maxStrips = ImMin<int64_t>(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS), MAXIMUM_WAIT_OBJECTS);
+	int64_t strips = ImClamp<int64_t>((int64_t)width * height / PIXELS_PER_STRIP, 1, maxStrips);
+
+	StripJob job;
+	job.tree = tree;
+	job.transform = transform;
+	job.width = width;
+	job.height = height;
+	job.dst = dst;
+	job.stripCount = (int)ImMin<int64_t>(strips, height);
+	job.requestId = requestId;
+
+	// The calling thread renders strips too, so it also finishes the job if thread creation fails
+	std::vector<HANDLE> threads;
+	for (int i = 1; i < job.stripCount; i++)
+	{
+		HANDLE hThread = CreateThread(NULL, 0, StripWorkerThread, &job, 0, NULL);
+		if (hThread)
+			threads.push_back(hThread);
+	}
+
+	StripWorkerThread(&job);
+
+	if (!threads.empty())
+		WaitForMultipleObjects((DWORD)threads.size(), threads.data(), TRUE, INFINITE);
+	for (HANDLE h : threads)
+		CloseHandle(h);
+
+	return !job.cancelled.load(std::memory_order_acquire);
+}
+
+// ============================================================================
 // Background Re-render Thread Implementation
 // ============================================================================
 
@@ -666,12 +808,10 @@ DWORD WINAPI BackgroundRenderThread(LPVOID lpParam)
 		transform.e = -request.svgViewX * scaleX;
 		transform.f = -request.svgViewY * scaleY;
 
-		// Render to MainPixels with mutex protection
-		size_t bufferSize = (size_t)request.texWidth * request.texHeight * 4;
-
+		// Render to MainPixels with mutex protection. A newer request stops it early;
+		// the request ID check below then discards the partial result.
 		EnterCriticalSection(&g_MainPixelsCS);
-		ZeroMemory(MainPixels, bufferSize);
-		resvg_render(request.tree, transform, request.texWidth, request.texHeight, (char*)MainPixels);
+		RenderParallel(request.tree, transform, request.texWidth, request.texHeight, MainPixels, request.requestId);
 		LeaveCriticalSection(&g_MainPixelsCS);
 
 		// Signal that rendering is complete
@@ -817,6 +957,31 @@ std::vector<std::wstring> ListSVGFiles(const std::wstring& dir)
 
 	std::sort(files.begin(), files.end());
 	return files;
+}
+
+// SVG size in whole pixels at 100% zoom. Rounded up and at least 1x1, so fractional or tiny
+// sizes never produce a zero-sized pixmap (resvg_render aborts the process on one).
+static void GetSvgPixelSize(const resvg_render_tree* tree, int& outW, int& outH)
+{
+	const float MAX_DIM = 16777216.0f; // keeps zoom math in int range for absurd declared sizes
+	resvg_size size = resvg_get_image_size(tree);
+	outW = (int)ImClamp(ceilf(size.width), 1.0f, MAX_DIM);
+	outH = (int)ImClamp(ceilf(size.height), 1.0f, MAX_DIM);
+}
+
+// Largest zoom (at most 100%) at which the whole SVG fits into a single texture / MainPixels
+static float CalcFitZoom(int svgW, int svgH)
+{
+	int largestDim = (svgW > svgH) ? svgW : svgH;
+	if (largestDim <= (int)g_MaxTextureSize)
+		return 1.0f;
+	return (float)g_MaxTextureSize / (float)largestDim;
+}
+
+// Pixel size of one SVG dimension at the given zoom, clamped to what a texture can hold
+static int ZoomedPixelSize(int svgDim, float zoom)
+{
+	return ImClamp((int)(svgDim * zoom), 1, (int)g_MaxTextureSize);
 }
 
 // Zoom and pan state
@@ -1148,7 +1313,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 	}
 	else
 	{
-		pMainFile = new std::filesystem::path(argv[1]);
+		// Absolute, so parent_path() is the SVG's folder even for a bare file name
+		std::error_code ec;
+		std::filesystem::path absPath = std::filesystem::absolute(argv[1], ec);
+		pMainFile = new std::filesystem::path(ec ? std::filesystem::path(argv[1]) : absPath);
 	}
 
 	if (argv)
@@ -1274,6 +1442,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
 	g_RESVG_Options = resvg_options_create();
 	resvg_options_load_system_fonts(g_RESVG_Options);
+	// Resolve relative <image href="..."> against the SVG's folder instead of the process working directory.
+	// Every SVG the viewer opens comes from this one folder, and the options are shared read-only
+	// by the thumbnail workers, so it is set once here before any parsing starts.
+	resvg_options_set_resources_dir(g_RESVG_Options, (const char*)pMainFile->parent_path().u8string().c_str());
 
 	ViewState view;
 	ImTextureID currentTexture = 0;
@@ -1293,29 +1465,25 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
 		g_MainSize = resvg_get_image_size(MainTree);
 
-		renderWidth = (uint32_t)g_MainSize.width;
-		renderHeight = (uint32_t)g_MainSize.height;
+		GetSvgPixelSize(MainTree, view.svgWidth, view.svgHeight);
 
-		view.svgWidth = renderWidth;
-		view.svgHeight = renderHeight;
+		// Start at a zoom where the whole SVG fits into one texture (100% unless it is huge)
+		view.zoom = CalcFitZoom(view.svgWidth, view.svgHeight);
+		view.renderRequestedZoom = view.zoom;
 
-		ZeroMemory(MainPixels, MainPixelsBufferSize);
+		renderWidth = (uint32_t)ZoomedPixelSize(view.svgWidth, view.zoom);
+		renderHeight = (uint32_t)ZoomedPixelSize(view.svgHeight, view.zoom);
 
-		// Create transform (scale to fit)
 		resvg_transform transform = resvg_transform_identity();
-		if (g_MainSize.width > 0)
-		{
-			float scale = (float)renderWidth / g_MainSize.width;
-			transform.a = scale; // scale X
-			transform.d = scale; // scale Y
-		}
+		transform.a = view.zoom; // scale X
+		transform.d = view.zoom; // scale Y
 
-		resvg_render(MainTree, transform, renderWidth, renderHeight, (char*)MainPixels);
+		RenderParallel(MainTree, transform, renderWidth, renderHeight, MainPixels, 0);
 
 		currentTexture = UploadTexture_D3D11(g_pd3dDevice, MainPixels, renderWidth, renderHeight);
 	}
 
-	view.lastRenderedZoom = 1.0f;
+	view.lastRenderedZoom = view.zoom;
 	view.hasViewportTexture = false;
 	view.texSvgViewX = 0;
 	view.texSvgViewY = 0;
@@ -1383,7 +1551,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 		if (view.needsRerender)
 		{
 			ULONGLONG currentTime = GetTickCount64();
-			if (currentTime - view.lastZoomTime >= 500) // 500ms delay after last zoom/pan
+			if (currentTime - view.lastZoomTime >= 250) // 250ms delay after last zoom/pan (stale renders stop early)
 			{
 				if (MainTree && view.svgWidth > 0 && view.svgHeight > 0)
 				{
@@ -1528,6 +1696,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 			DrawCheckerBackground(contentPos, contentEnd, c1, c2, 16.0f);
 
 			// Draw the image - position depends on whether texture is full SVG or viewport
+			ImGui::GetWindowDrawList()->AddCallback(SetPremultipliedBlend, nullptr);
 			if (view.hasViewportTexture)
 			{
 				// Viewport texture: texture covers texSvgView* in SVG space
@@ -1549,6 +1718,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 				// Full SVG texture: draw as before
 				ImGui::GetWindowDrawList()->AddImage(currentTexture, imagePos, imageEnd);
 			}
+			ImGui::GetWindowDrawList()->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
 
 			// Handle input
 			ImVec2 mousePos = io.MousePos;
@@ -1707,13 +1877,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
 									if (savePixels)
 									{
-										memset(savePixels, 0, saveBufferSize);
-
 										resvg_transform saveTransform = resvg_transform_identity();
 										saveTransform.a = view.zoom;
 										saveTransform.d = view.zoom;
 
-										resvg_render(MainTree, saveTransform, saveWidth, saveHeight, (char*)savePixels);
+										RenderParallel(MainTree, saveTransform, saveWidth, saveHeight, savePixels, 0);
+										UnpremultiplyAlpha(savePixels, (size_t)saveWidth * saveHeight);
 
 										FILE* f = _wfopen(savePath.c_str(), L"wb");
 										if (f)
@@ -1809,22 +1978,24 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
 					g_MainSize = resvg_get_image_size(MainTree);
 
-					renderWidth = (uint32_t)g_MainSize.width;
-					renderHeight = (uint32_t)g_MainSize.height;
+					GetSvgPixelSize(MainTree, view.svgWidth, view.svgHeight);
 
-					// Create transform (scale to fit)
+					// Reset view state, starting at a zoom where the whole SVG fits into one texture
+					view.Reset();
+					view.zoom = CalcFitZoom(view.svgWidth, view.svgHeight);
+					view.lastRenderedZoom = view.zoom;
+					view.renderRequestedZoom = view.zoom;
+
+					renderWidth = (uint32_t)ZoomedPixelSize(view.svgWidth, view.zoom);
+					renderHeight = (uint32_t)ZoomedPixelSize(view.svgHeight, view.zoom);
+
 					resvg_transform NewTransform = resvg_transform_identity();
-					if (g_MainSize.width > 0)
-					{
-						float scale = (float)renderWidth / g_MainSize.width;
-						NewTransform.a = scale; // scale X
-						NewTransform.d = scale; // scale Y
-					}
+					NewTransform.a = view.zoom; // scale X
+					NewTransform.d = view.zoom; // scale Y
 
 					// Render with mutex protection (background thread may also use MainPixels)
 					EnterCriticalSection(&g_MainPixelsCS);
-					ZeroMemory(MainPixels, MainPixelsBufferSize);
-					resvg_render(MainTree, NewTransform, renderWidth, renderHeight, (char*)MainPixels);
+					RenderParallel(MainTree, NewTransform, renderWidth, renderHeight, MainPixels, 0);
 
 					ReleaseTexture_D3D11(currentTexture);
 					currentTexture = 0;
@@ -1832,18 +2003,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 					currentTexture = UploadTexture_D3D11(g_pd3dDevice, MainPixels, renderWidth, renderHeight);
 					LeaveCriticalSection(&g_MainPixelsCS);
 
-					view.svgWidth = renderWidth;
-					view.svgHeight = renderHeight;
-					view.lastRenderedZoom = 1.0f;
-
-					// Reset view state
-					view.Reset();
-
-					// Set up full-SVG viewport tracking
+					// Set up full-SVG viewport tracking (SVG units, not texture pixels)
 					view.texSvgViewX = 0;
 					view.texSvgViewY = 0;
-					view.texSvgViewW = (float)renderWidth;
-					view.texSvgViewH = (float)renderHeight;
+					view.texSvgViewW = (float)view.svgWidth;
+					view.texSvgViewH = (float)view.svgHeight;
 
 					// Switch to main view
 					g_ShowMainWindow = true;
