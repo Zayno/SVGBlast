@@ -1,0 +1,128 @@
+diff -ru a/crates/resvg/src/clip.rs b/crates/resvg/src/clip.rs
+--- a/crates/resvg/src/clip.rs
++++ b/crates/resvg/src/clip.rs
+@@ -43,6 +43,7 @@
+                 // We could use any values here. They will not be used anyway.
+                 let ctx = Context {
+                     max_bbox: tiny_skia::IntRect::from_xywh(0, 0, 1, 1).unwrap(),
++                    layer_bbox: tiny_skia::IntRect::from_xywh(0, 0, 1, 1).unwrap(),
+                 };
+ 
+                 crate::path::fill_path(path, mode, &ctx, transform, pixmap);
+diff -ru a/crates/resvg/src/filter/mod.rs b/crates/resvg/src/filter/mod.rs
+--- a/crates/resvg/src/filter/mod.rs
++++ b/crates/resvg/src/filter/mod.rs
+@@ -890,6 +890,7 @@
+ 
+     let ctx = crate::render::Context {
+         max_bbox: tiny_skia::IntRect::from_xywh(0, 0, region.width(), region.height()).unwrap(),
++        layer_bbox: tiny_skia::IntRect::from_xywh(0, 0, region.width(), region.height()).unwrap(),
+     };
+ 
+     crate::render::render_nodes(fe.root(), &ctx, transform, &mut pixmap.as_mut());
+diff -ru a/crates/resvg/src/lib.rs b/crates/resvg/src/lib.rs
+--- a/crates/resvg/src/lib.rs
++++ b/crates/resvg/src/lib.rs
+@@ -38,7 +38,10 @@
+ ) {
+     let max_bbox = max_filter_bbox(pixmap.width(), pixmap.height());
+ 
+-    let ctx = render::Context { max_bbox };
++    let ctx = render::Context {
++        max_bbox,
++        layer_bbox: tiny_skia::IntRect::from_xywh(0, 0, pixmap.width(), pixmap.height()).unwrap(),
++    };
+     render::render_nodes(tree.root(), &ctx, transform, pixmap);
+ }
+ 
+@@ -63,7 +66,10 @@
+ 
+     transform = transform.pre_translate(-bbox.x(), -bbox.y());
+ 
+-    let ctx = render::Context { max_bbox };
++    let ctx = render::Context {
++        max_bbox,
++        layer_bbox: tiny_skia::IntRect::from_xywh(0, 0, pixmap.width(), pixmap.height()).unwrap(),
++    };
+     render::render_node(node, &ctx, transform, pixmap);
+ 
+     Some(())
+diff -ru a/crates/resvg/src/path.rs b/crates/resvg/src/path.rs
+--- a/crates/resvg/src/path.rs
++++ b/crates/resvg/src/path.rs
+@@ -194,7 +194,8 @@
+     let mut pixmap = tiny_skia::Pixmap::new(img_size.width(), img_size.height())?;
+ 
+     let transform = tiny_skia::Transform::from_scale(sx, sy);
+-    crate::render::render_nodes(pattern.root(), ctx, transform, &mut pixmap.as_mut());
++    let pattern_ctx = ctx.for_pixmap(pixmap.width(), pixmap.height());
++    crate::render::render_nodes(pattern.root(), &pattern_ctx, transform, &mut pixmap.as_mut());
+ 
+     let mut ts = tiny_skia::Transform::default();
+     ts = ts.pre_concat(pattern.transform());
+diff -ru a/crates/resvg/src/render.rs b/crates/resvg/src/render.rs
+--- a/crates/resvg/src/render.rs
++++ b/crates/resvg/src/render.rs
+@@ -5,6 +5,19 @@
+ 
+ pub struct Context {
+     pub max_bbox: tiny_skia::IntRect,
++    /// The part of the current pixmap that can end up in the final image.
++    /// Layers of groups without filters never need to extend past it.
++    pub layer_bbox: tiny_skia::IntRect,
++}
++
++impl Context {
++    /// A context for drawing into a new `width` x `height` pixmap that is needed in full.
++    pub fn for_pixmap(&self, width: u32, height: u32) -> Context {
++        Context {
++            max_bbox: self.max_bbox,
++            layer_bbox: tiny_skia::IntRect::from_xywh(0, 0, width, height).unwrap(),
++        }
++    }
+ }
+ 
+ pub fn render_nodes(
+@@ -77,7 +90,7 @@
+ 
+     let max_bbox = ctx.max_bbox.to_rect().transform(inv_rest)?.round_out()?;
+     let (layer, ibbox) =
+-        render_layer(group, &Context { max_bbox }, inv_rest.pre_concat(transform))?;
++        render_layer(group, &Context { max_bbox, layer_bbox: ctx.layer_bbox }, inv_rest.pre_concat(transform))?;
+ 
+     let paint = tiny_skia::Paint {
+         shader: tiny_skia::Pattern::new(
+@@ -129,10 +142,11 @@
+         crate::geom::fit_to_rect(bbox, ctx.max_bbox)?
+     };
+ 
+-    // Make sure our layer is not bigger than 4x the canvas size.
+-    // This is required to prevent huge layers.
++    // Without filters, nothing outside the visible part of the target can affect the result,
++    // so the layer does not have to be bigger than that. At high zoom levels most groups
++    // cover the whole canvas, and this keeps their layers canvas-sized instead of 25x it.
+     if group.filters().is_empty() {
+-        ibbox = crate::geom::fit_to_rect(ibbox, ctx.max_bbox)?;
++        ibbox = crate::geom::fit_to_rect(ibbox, ctx.layer_bbox)?;
+     }
+ 
+     let shift_ts = {
+@@ -152,7 +166,8 @@
+     let mut sub_pixmap = tiny_skia::Pixmap::new(ibbox.width(), ibbox.height())
+         .log_none(|| log::warn!("Failed to allocate a group layer for: {:?}.", ibbox))?;
+ 
+-    render_nodes(group, ctx, transform, &mut sub_pixmap.as_mut());
++    let layer_ctx = ctx.for_pixmap(ibbox.width(), ibbox.height());
++    render_nodes(group, &layer_ctx, transform, &mut sub_pixmap.as_mut());
+ 
+     if !group.filters().is_empty() {
+         for filter in group.filters() {
+@@ -165,7 +180,7 @@
+     }
+ 
+     if let Some(mask) = group.mask() {
+-        crate::mask::apply(mask, ctx, transform, &mut sub_pixmap);
++        crate::mask::apply(mask, &layer_ctx, transform, &mut sub_pixmap);
+     }
+ 
+     Some((sub_pixmap, ibbox))

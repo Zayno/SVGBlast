@@ -14,9 +14,9 @@
 #include <stdint.h>
 
 #define RESVG_MAJOR_VERSION 0
-#define RESVG_MINOR_VERSION 47
+#define RESVG_MINOR_VERSION 49
 #define RESVG_PATCH_VERSION 0
-#define RESVG_VERSION "0.47.0"
+#define RESVG_VERSION "0.49.0"
 
 /**
  * @brief List of possible errors.
@@ -30,6 +30,10 @@ typedef enum {
      * Only UTF-8 content are supported.
      */
     RESVG_ERROR_NOT_AN_UTF8_STR,
+    /**
+     * SVGZ decoding is unsupported.
+     */
+    RESVG_ERROR_SVGZ_UNSUPPORTED,
     /**
      * Failed to open the provided file.
      */
