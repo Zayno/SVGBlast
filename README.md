@@ -8,6 +8,13 @@ A fast, lightweight SVG viewer for Windows with GPU-accelerated rendering.
 
 ---
 ![SVGBlast Wiaam Suleiman.](/Images/Banner.png "SVG Blast")
+## Download
+
+Get the [latest release](https://github.com/Zayno/SVGBlast/releases/latest). Two options:
+
+- **Installer** (`SVGBlast-x.y-Setup.exe`): installs SVGBlast for you (no admin needed) or for all users, adds it to the Start menu and registers it for `.svg` files. On the last page it can open Windows' Default apps settings so you can make SVGBlast your SVG viewer.
+- **Portable** (`SVGBlast-x.y-Portable.exe`): a single exe, nothing to install. Run it, or drag an SVG onto it.
+
 ## Features
 
 **Viewer**
